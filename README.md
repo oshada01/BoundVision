@@ -27,3 +27,6 @@ Fine-tuning sensor thresholds for different vibration intensities.
 Expanding the code to include data logging or wireless transmission.
 
 Designing a modular architecture for additional sensor types.
+
+Current Status as per 28/05/2025
+Project is all together, uploaded the arduino code.
