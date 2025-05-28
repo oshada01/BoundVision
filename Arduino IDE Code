@@ -1,0 +1,221 @@
+#include <Arduino.h>
+#include <WiFi.h>
+#include <WiFiClientSecure.h>
+#include <FirebaseESP32.h>
+
+// --- Sensor Pins ---
+const int trigPin = 5;        // Ultrasonic sensor trigger
+const int echoPin = 18;       // Ultrasonic sensor echo
+const int vibPin = 33;        // Vibration Sensor (SW-18010P, analog)
+const int micPin = 35;        // Sound Sensor (LM393, analog)
+const int groundFoilPin = 32; // Foil contact pin
+
+// --- LED Pins ---
+const int foilDetectionLed = 23;  // LED for foil contact
+const int vibrationLed = 22;      // LED for vibration
+const int soundLed = 21;          // LED for sound
+
+// Network and Firebase
+#define WIFI_SSID "Dialog 4G"
+#define WIFI_PASSWORD "25HEN36RGFM"
+#define FIREBASE_HOST "boundvision-default-rtdb.asia-southeast1.firebasedatabase.app"
+#define FIREBASE_AUTH "YOUR_FIREBASE_DATABASE_SECRET"
+
+// --- Thresholds ---
+const int BOUNDARY_DISTANCE = 15;     // Ultrasonic threshold (cm)
+const int SOUND_MIN = 600;            // Sound detection min
+const int SOUND_MAX = 4000;           // Sound detection max
+const int VIBRATION_MIN = 1000;       // Vibration detection min
+const int VIBRATION_MAX = 1800;       // Vibration detection max
+const unsigned long MONITORING_PERIOD = 5000;  // 5-second monitoring
+const unsigned long sendInterval = 200;        // Firebase update interval
+
+// Firebase objects
+FirebaseData firebaseData;
+FirebaseAuth auth;
+FirebaseConfig config;
+
+// --- State Variables ---
+bool monitoringActive = false;
+unsigned long monitoringStartTime = 0;
+unsigned long lastSendTime = 0;
+
+// Sensor detection flags
+bool foilContactDetected = false;
+bool vibrationDetected = false;
+bool soundDetected = false;
+
+void setup() {
+  Serial.begin(115200);
+  
+  // Sensor Pins
+  pinMode(trigPin, OUTPUT);
+  pinMode(echoPin, INPUT);
+  pinMode(vibPin, INPUT);        // Analog mode for vibration
+  pinMode(micPin, INPUT);        // Analog mode for sound
+  pinMode(groundFoilPin, INPUT_PULLDOWN); // Foil with pull-down
+  
+  // LED Pins
+  pinMode(foilDetectionLed, OUTPUT);
+  pinMode(vibrationLed, OUTPUT);
+  pinMode(soundLed, OUTPUT);
+  
+  // LEDs off initially
+  digitalWrite(foilDetectionLed, LOW);
+  digitalWrite(vibrationLed, LOW);
+  digitalWrite(soundLed, LOW);
+  
+  // Connect to WiFi
+  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+  Serial.print("Connecting to WiFi");
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(300);
+    Serial.print(".");
+  }
+  Serial.println("\nConnected with IP: " + WiFi.localIP().toString());
+
+  // Initialize Firebase
+  config.host = FIREBASE_HOST;
+  config.signer.tokens.legacy_token = FIREBASE_AUTH;
+  
+  Firebase.begin(&config, &auth);
+  Firebase.reconnectWiFi(true);
+  
+  Serial.println("System Ready. Waiting for events...");
+}
+
+// Smoothed analog readings to reduce noise
+int readSoundSmoothed() {
+  const int numReadings = 10;
+  int total = 0;
+  for (int i = 0; i < numReadings; i++) {
+    total += analogRead(micPin);
+    delay(10);
+  }
+  return total / numReadings;
+}
+
+int readVibrationSmoothed() {
+  const int numReadings = 10;
+  int total = 0;
+  for (int i = 0; i < numReadings; i++) {
+    total += analogRead(vibPin);
+    delay(10);
+  }
+  return total / numReadings;
+}
+
+float readUltrasonicDistance() {
+  digitalWrite(trigPin, LOW);
+  delayMicroseconds(2);
+  digitalWrite(trigPin, HIGH);
+  delayMicroseconds(
+
+10);
+  digitalWrite(trigPin, LOW);
+  
+  long duration = pulseIn(echoPin, HIGH, 20000);
+  return duration == 0 ? 999.0 : duration * 0.0343 / 2;
+}
+
+void loop() {
+  // Read sensors
+  float distance = readUltrasonicDistance();
+  int soundValue = readSoundSmoothed();
+  int vibValue = readVibrationSmoothed();
+  bool foilContact = digitalRead(groundFoilPin);
+  
+  // Apply thresholds
+  bool soundEventDetected = (soundValue >= SOUND_MIN && soundValue <= SOUND_MAX);
+  bool vibrationEventDetected = (vibValue >= VIBRATION_MIN && vibValue <= VIBRATION_MAX);
+  bool ultrasonicEventDetected = (distance < BOUNDARY_DISTANCE);
+  bool foilContactEventDetected = (foilContact == HIGH);
+
+  // Control LEDs
+  digitalWrite(soundLed, soundEventDetected ? HIGH : LOW);
+  digitalWrite(vibrationLed, vibrationEventDetected ? HIGH : LOW);
+  digitalWrite(foilDetectionLed, foilContactEventDetected ? HIGH : LOW);
+
+  // Debug output
+  Serial.print("Distance: ");
+  Serial.print(distance);
+  Serial.print("cm | Vib (Analog): ");
+  Serial.print(vibValue);
+  Serial.print(" | Sound: ");
+  Serial.print(soundValue);
+  Serial.print(" | Foil Contact: ");
+  Serial.println(foilContactEventDetected ? "CONNECTED" : "DISCONNECTED");
+  
+  // Start monitoring if an event is detected
+  if (!monitoringActive) {
+    if (soundEventDetected || vibrationEventDetected || ultrasonicEventDetected || foilContactEventDetected) {
+      monitoringActive = true;
+      monitoringStartTime = millis();
+      
+      foilContactDetected = false;
+      vibrationDetected = false;
+      soundDetected = false;
+      
+      Serial.println("\n*** 5-SECOND MONITORING STARTED ***");
+    }
+  }
+  
+  // During monitoring
+  if (monitoringActive) {
+    if (foilContactEventDetected) foilContactDetected = true;
+    if (vibrationEventDetected) vibrationDetected = true;
+    if (soundEventDetected) soundDetected = true;
+    
+    if (millis() - monitoringStartTime >= MONITORING_PERIOD) {
+      monitoringActive = false;
+      
+      Serial.println("\n*** MONITORING COMPLETE - RESULTS ***");
+      Serial.print("Foil Contact: ");
+      Serial.println(foilContactDetected ? "DETECTED" : "NOT DETECTED");
+      Serial.print("Vibration: ");
+      Serial.println(vibrationDetected ? "DETECTED" : "NOT DETECTED");
+      Serial.print("Sound: ");
+      Serial.println(soundDetected ? "DETECTED" : "NOT DETECTED");
+      
+      // Determine score type based on detection (matching Android app logic)
+      String scoreType = "";
+      if (foilContactDetected && !vibrationDetected && !soundDetected) {
+        scoreType = "SIX";
+      } else if (vibrationDetected && soundDetected) {
+        scoreType = "FOUR";
+      } else if (vibrationDetected && !soundDetected) {
+        scoreType = "WICKET";
+      }
+      
+      // Send results to Firebase
+      if (Firebase.ready()) {
+        Firebase.setBool(firebaseData, "/detection/foil_contact", foilContactDetected);
+        Firebase.setBool(firebaseData, "/detection/vibration", vibrationDetected);
+        Firebase.setBool(firebaseData, "/detection/sound", soundDetected);
+        
+        // Set score type if applicable
+        if (scoreType != "") {
+          Firebase.setString(firebaseData, "/cricket_score/type", scoreType);
+        }
+      }
+    }
+  }
+  
+  // Send sensor data to Firebase periodically
+  if (Firebase.ready() && (millis() - lastSendTime >= sendInterval)) {
+    lastSendTime = millis();
+    
+    Firebase.setFloat(firebaseData, "/sensor/distance", distance);
+    Firebase.setInt(firebaseData, "/sensor/sound", soundValue);
+    Firebase.setBool(firebaseData, "/sensor/vibration", vibrationEventDetected);
+    Firebase.setBool(firebaseData, "/sensor/foil_contact", foilContact);
+    Firebase.setBool(firebaseData, "/system/monitoring_active", monitoringActive);
+    
+    if (monitoringActive) {
+      Firebase.setInt(firebaseData, "/system/monitoring_remaining_ms", 
+                     MONITORING_PERIOD - (millis() - monitoringStartTime));
+    }
+  }
+  
+  delay(100);
+}
